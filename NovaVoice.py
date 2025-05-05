@@ -9,9 +9,6 @@ import webbrowser
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
-ACCESS_KEY = os.getenv("PV_ACCESS_KEY")
-
 # === Config ===
 ACCESS_KEY = "PV_ACCESS_KEY"
 WAKE_WORD_PPN = "hey-assistant_en_windows.ppn"
