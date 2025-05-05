@@ -8,7 +8,7 @@ import speech_recognition as sr
 import webbrowser
 
 # === Config ===
-ACCESS_KEY = "fuEak7sP/M9V/gnzw3HJalsiN5WlYhmWdDTO7USR6DlIcYzG1SdDaw=="
+ACCESS_KEY = "PV_ACCESS_KEY"
 WAKE_WORD = "hey-assistant_en_windows.ppn"
 
 # === Locks & Initialization ===
