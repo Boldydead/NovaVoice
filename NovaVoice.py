@@ -1,196 +1,259 @@
+import os
+import json
+import threading
 import pvporcupine
 import pyaudio
 import struct
 import subprocess
-import os
 import pyttsx3
 import speech_recognition as sr
 import webbrowser
+import tkinter as tk
+from tkinter import filedialog
 from dotenv import load_dotenv
-import os
 
-# === Config ===
-ACCESS_KEY = "PV_ACCESS_KEY"
+# === Config & Constants ===
+load_dotenv()
+ACCESS_KEY = os.getenv("PV_ACCESS_KEY")
 WAKE_WORD_PPN = "hey-assistant_en_windows.ppn"
+CACHE_FILE = "exe_cache.json"
+SEARCH_PATHS = [
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+    r"C:\Users"
+]
 
-# === Locks & Initialization ===
+# === Load or Initialize Cache ===
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "r") as f:
+        exe_cache = json.load(f)
+else:
+    exe_cache = {}
+
+def save_cache():
+    with open(CACHE_FILE, "w") as f:
+        json.dump(exe_cache, f)
+
+# === TTS & Recognizer ===
 tts = pyttsx3.init()
 tts.setProperty('rate', 175)
 tts.setProperty('volume', 1.0)
-
 recognizer = sr.Recognizer()
-
+mic = sr.Microphone()
 
 def speak(text):
     tts.say(text)
     tts.runAndWait()
 
+# === Finder & Launcher (async helper) ===
+def find_executable(exe_name):
+    for base in SEARCH_PATHS:
+        if not os.path.exists(base):
+            continue
+        for root, _, files in os.walk(base):
+            if exe_name.lower() in (f.lower() for f in files):
+                return os.path.join(root, exe_name)
+    return None
 
-# === Speech Recognizer ===
-recognizer = sr.Recognizer()
-mic = sr.Microphone()
+def launch_executable_async(exe_name, app_name):
+    path = exe_cache.get(exe_name)
+    # clear stale cache
+    if path and not os.path.exists(path):
+        exe_cache.pop(exe_name, None)
+        path = None
 
-# === Porcupine & PyAudio Initialization ===
-porcupine = pvporcupine.create(
-    access_key=ACCESS_KEY,
-    keyword_paths=[WAKE_WORD_PPN],
-    sensitivities=[0.7]
-)
+    if path:
+        os.startfile(path)
+        speak(f"Opening {app_name}.")
+        return True
 
-pa = pyaudio.PyAudio()
-stream = pa.open(
-    rate=porcupine.sample_rate,
-    channels=1,
-    format=pyaudio.paInt16,
-    input=True,
-    frames_per_buffer=porcupine.frame_length
-
-)
-
-
-# === Program launcher helper ===
-def search_and_launch_program(exe_names, app_name):
-    """
-    Searches common Program Files directories for any of the given exe_names.
-    If found, speaks the full path then launches it.
-    Returns True on success, False otherwise.
-    """
-    for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
-        for root, dirs, files in os.walk(base):
-            for f in files:
-                if f.lower() in exe_names:
-                    full_path = os.path.join(root, f)
-                    speak(f"Found {app_name} in {root}")
-                    subprocess.Popen([full_path])
-                    speak(f"Opening {app_name}.")
-                    return True
+    speak(f"Searching for {app_name}, please wait.")
+    def _search():
+        found = find_executable(exe_name)
+        if found:
+            exe_cache[exe_name] = found
+            save_cache()
+            os.startfile(found)
+            speak(f"Found and opening {app_name}.")
+        else:
+            speak(f"Sorry, I couldn’t find {app_name}.")
+    threading.Thread(target=_search, daemon=True).start()
     return False
 
-
+# === Built-in Web Openers ===
 def open_browser():
-    # Try Microsoft Edge first (UWP app)
     try:
         os.system("start microsoft-edge:https://www.google.com")
-        speak("Opening Microsoft Edge for you.")
-        return
+        speak("Opening Microsoft Edge.")
     except:
-        pass
+        speak("Falling back to default browser.")
+        launch_executable_async("chrome.exe", "Google Chrome")
 
-    # Fallback to installed browsers
-    exe_names = ["chrome.exe", "firefox.exe", "brave.exe"]
-    if not search_and_launch_program(exe_names, "browser"):
-        speak("Hmm, I couldn't find a browser.")
+# === GUI Prompt for Manual Path ===
+def prompt_for_exe(title="Select executable"):
+    root = tk.Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Executable", "*.exe")],
+        initialdir=os.path.expanduser("~")
+    )
+    root.destroy()
+    return path
 
-
-def open_ide():
-    exe_names = ["code.exe", "pycharm64.exe", "idea64.exe", "eclipse.exe"]
-    if not search_and_launch_program(exe_names, "code editor"):
-        speak("Sorry, I couldn't find any coding apps installed.")
-
-
-# === Voice Command Logic ===
+# === Voice Command Handling ===
 def handle_command(phrase_time=4.0):
-    # Prompt for action
     speak("What would you like me to open?")
-    # Capture the next few seconds of audio frames
     frames = []
     reads = int(porcupine.sample_rate / porcupine.frame_length * phrase_time)
     for _ in range(reads):
         pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
         frames.append(pcm)
-    raw_data = b"".join(frames)
-    audio_data = sr.AudioData(raw_data, porcupine.sample_rate, 2)
+    audio_data = sr.AudioData(b"".join(frames), porcupine.sample_rate, 2)
 
     try:
         command = recognizer.recognize_google(audio_data).lower().strip()
         speak(f"You said: {command}")
     except sr.UnknownValueError:
-        speak("Sorry, I couldn't catch that.")
+        speak("Sorry, I didn't catch that.")
         return
     except sr.RequestError:
         speak("It seems I'm offline.")
         return
 
-    # Remove wake triggers
     for trigger in ("hey assistant", "assistant", "hey"):
         if command.startswith(trigger):
             command = command.replace(trigger, "", 1).strip()
 
-    # Built-in commands
-    if "google" in command:
-        webbrowser.open("https://www.google.com")
-        speak("Opening Google.")
-    elif "youtube" in command:
-        webbrowser.open("https://www.youtube.com")
-        speak("Opening YouTube.")
-    elif "edge" in command:
-        speak("Launching Microsoft Edge.")
-        os.system("start microsoft-edge:https://www.google.com")
-    elif "chrome" in command:
-        search_and_launch_program(["chrome.exe"], "Google Chrome")
-    elif "firefox" in command:
-        search_and_launch_program(["firefox.exe"], "Mozilla Firefox")
-    elif "brave" in command:
-        search_and_launch_program(["brave.exe"], "Brave Browser")
-    elif "pycharm" in command:
-        # Try auto-detect first
-        if not search_and_launch_program(["pycharm64.exe"], "PyCharm"):
-            # If not found, ask for directory
-            speak("I couldn’t find PyCharm automatically. Please tell me the full path to the PyCharm executable.")
-            with mic as source:
-                recognizer.adjust_for_ambient_noise(source, duration=1)
-                try:
-                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=8)
-                    custom_path = recognizer.recognize_google(audio).strip()
-                    if os.path.exists(custom_path):
-                        dir_root = os.path.dirname(custom_path)
-                        speak(f"Found PyCharm in {dir_root}")
-                        subprocess.Popen([custom_path])
-                        speak("Opening PyCharm.")
-                    else:
-                        speak("That path doesn’t exist. Please check the path and try again.")
-                except sr.UnknownValueError:
-                    speak("Sorry, I couldn't understand the path.")
-                except sr.RequestError:
-                    speak("I think I'm offline right now.")
-    elif "code" in command or "visual studio" in command:
-        search_and_launch_program(["code.exe"], "Visual Studio Code")
-    elif "intellij" in command:
-        search_and_launch_program(["idea64.exe"], "IntelliJ IDEA")
-    else:
-        speak("I'm not sure how to open that.")
+    # --- Command Routing ---
 
+    # Web
+    if "google" in command:
+        webbrowser.open("https://www.google.com"); speak("Opening Google.")
+    elif "youtube" in command:
+        webbrowser.open("https://www.youtube.com"); speak("Opening YouTube.")
+    elif "edge" in command:
+        open_browser()
+
+    # Browsers
+    elif "chrome" in command:
+        launch_executable_async("chrome.exe", "Google Chrome")
+    elif "firefox" in command:
+        launch_executable_async("firefox.exe", "Mozilla Firefox")
+    elif "brave" in command:
+        launch_executable_async("brave.exe", "Brave Browser")
+
+    # PyCharm
+    elif "pycharm" in command:
+        launch_executable_async("pycharm64.exe", "PyCharm")
+
+    # Full Visual Studio
+    elif "visual studio" in command:
+        vs_key = "devenv.exe"
+        vs_default = r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\devenv.exe"
+        if os.path.exists(vs_default):
+            os.startfile(vs_default)
+            exe_cache[vs_key] = vs_default
+            save_cache()
+            speak("Opening Visual Studio.")
+        else:
+            found = find_executable(vs_key)
+            if found:
+                exe_cache[vs_key] = found
+                save_cache()
+                os.startfile(found)
+                speak("Found and opening Visual Studio.")
+            else:
+                speak("Please select the Visual Studio executable.")
+                manual = prompt_for_exe("Locate devenv.exe")
+                if manual and os.path.exists(manual):
+                    os.startfile(manual)
+                    exe_cache[vs_key] = manual
+                    save_cache()
+                    speak("Opening Visual Studio.")
+                else:
+                    speak("That path doesn’t exist or wasn’t selected.")
+
+    # VS Code — **synchronous & GUI prompt** if all else fails
+    elif "code" in command:
+        code_key = "code.exe"
+        # 1) Clear stale cache
+        if code_key in exe_cache and not os.path.exists(exe_cache[code_key]):
+            exe_cache.pop(code_key); save_cache()
+
+        # 2) Try per-user & system installs
+        user_path = os.path.expandvars(r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe")
+        system_path = r"C:\Program Files\Microsoft VS Code\Code.exe"
+        if os.path.exists(user_path):
+            os.startfile(user_path)
+            exe_cache[code_key] = user_path
+            save_cache()
+            speak("Opening Visual Studio Code.")
+        elif os.path.exists(system_path):
+            os.startfile(system_path)
+            exe_cache[code_key] = system_path
+            save_cache()
+            speak("Opening Visual Studio Code.")
+        else:
+            # 3) Limited search
+            found = find_executable(code_key)
+            if found:
+                os.startfile(found)
+                exe_cache[code_key] = found
+                save_cache()
+                speak("Found and opening Visual Studio Code.")
+            else:
+                # 4) GUI prompt
+                speak("Please select the VS Code executable.")
+                manual = prompt_for_exe("Locate Code.exe")
+                if manual and os.path.exists(manual):
+                    os.startfile(manual)
+                    exe_cache[code_key] = manual
+                    save_cache()
+                    speak("Opening Visual Studio Code.")
+                else:
+                    speak("That path doesn’t exist or wasn’t selected.")
+
+    # IntelliJ
+    elif "intellij" in command:
+        launch_executable_async("idea64.exe", "IntelliJ IDEA")
+
+    else:
+        speak("I’m not sure how to open that.")
 
 # === Main Wake-Word Loop ===
-porcupine = pvporcupine.create(
-    access_key=ACCESS_KEY,
-    keyword_paths=[WAKE_WORD_PPN],
-    sensitivities=[0.7]
-)
+def main():
+    global porcupine, pa, stream
+    porcupine = pvporcupine.create(
+        access_key=ACCESS_KEY,
+        keyword_paths=[WAKE_WORD_PPN],
+        sensitivities=[0.7]
+    )
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        rate=porcupine.sample_rate,
+        channels=1,
+        format=pyaudio.paInt16,
+        input=True,
+        frames_per_buffer=porcupine.frame_length
+    )
 
-pa = pyaudio.PyAudio()
-stream = pa.open(
-    rate=porcupine.sample_rate,
-    channels=1,
-    format=pyaudio.paInt16,
-    input=True,
-    frames_per_buffer=porcupine.frame_length
-)
+    speak("Assistant ready. Say 'hey assistant' to begin.")
+    try:
+        while True:
+            pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+            frame = struct.unpack_from("h" * porcupine.frame_length, pcm)
+            if porcupine.process(frame) >= 0:
+                handle_command()
+                speak("Listening for wake word again.")
+    except KeyboardInterrupt:
+        speak("Goodbye.")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+        porcupine.delete()
+        tts.stop()
 
-speak("Assistant ready. Say 'hey assistant' to begin.")
-
-try:
-    while True:
-        pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
-        frame = struct.unpack_from("h" * porcupine.frame_length, pcm)
-        if porcupine.process(frame) >= 0:
-            handle_command(phrase_time=4.0)
-            speak("Listening for wake word again.")
-except KeyboardInterrupt:
-    pass
-finally:
-    stream.stop_stream()
-    stream.close()
-    pa.terminate()
-    porcupine.delete()
-    tts.stop()
+if __name__ == "__main__":
+    main()
