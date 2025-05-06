@@ -14,21 +14,28 @@ from dotenv import load_dotenv
 
 # === Config & Constants ===
 load_dotenv()
-ACCESS_KEY = os.getenv("PV_ACCESS_KEY")
-WAKE_WORD_PPN = "hey-assistant_en_windows.ppn"
-CACHE_FILE = "exe_cache.json"
-SEARCH_PATHS = [
+ACCESS_KEY        = os.getenv("PV_ACCESS_KEY")
+WAKE_WORD_PPN     = "hey-assistant_en_windows.ppn"
+CACHE_FILE        = "exe_cache.json"
+CUSTOM_CMDS_FILE  = "custom_commands.json"
+SEARCH_PATHS      = [
     r"C:\Program Files",
     r"C:\Program Files (x86)",
     r"C:\Users"
 ]
 
-# === Load or Initialize Cache ===
+# === Load or Initialize Cache & Custom Commands ===
 if os.path.exists(CACHE_FILE):
     with open(CACHE_FILE, "r") as f:
         exe_cache = json.load(f)
 else:
     exe_cache = {}
+
+if os.path.exists(CUSTOM_CMDS_FILE):
+    with open(CUSTOM_CMDS_FILE, "r") as f:
+        custom_commands = json.load(f).get("commands", [])
+else:
+    custom_commands = []
 
 def save_cache():
     with open(CACHE_FILE, "w") as f:
@@ -57,7 +64,6 @@ def find_executable(exe_name):
 
 def launch_executable_async(exe_name, app_name):
     path = exe_cache.get(exe_name)
-    # clear stale cache
     if path and not os.path.exists(path):
         exe_cache.pop(exe_name, None)
         path = None
@@ -68,7 +74,7 @@ def launch_executable_async(exe_name, app_name):
         return True
 
     speak(f"Searching for {app_name}, please wait.")
-    def _search():
+    def _search_and_launch():
         found = find_executable(exe_name)
         if found:
             exe_cache[exe_name] = found
@@ -77,7 +83,7 @@ def launch_executable_async(exe_name, app_name):
             speak(f"Found and opening {app_name}.")
         else:
             speak(f"Sorry, I couldn’t find {app_name}.")
-    threading.Thread(target=_search, daemon=True).start()
+    threading.Thread(target=_search_and_launch, daemon=True).start()
     return False
 
 # === Built-in Web Openers ===
@@ -121,46 +127,47 @@ def handle_command(phrase_time=4.0):
         speak("It seems I'm offline.")
         return
 
+    # strip wake words
     for trigger in ("hey assistant", "assistant", "hey"):
         if command.startswith(trigger):
             command = command.replace(trigger, "", 1).strip()
 
-    # --- Command Routing ---
+    # --- Built-in Command Routing ---
 
     # Web
     if "google" in command:
         webbrowser.open("https://www.google.com"); speak("Opening Google.")
-    elif "youtube" in command:
+        return
+    if "youtube" in command:
         webbrowser.open("https://www.youtube.com"); speak("Opening YouTube.")
-    elif "edge" in command:
-        open_browser()
+        return
+    if "edge" in command:
+        open_browser(); return
 
     # Browsers
-    elif "chrome" in command:
-        launch_executable_async("chrome.exe", "Google Chrome")
-    elif "firefox" in command:
-        launch_executable_async("firefox.exe", "Mozilla Firefox")
-    elif "brave" in command:
-        launch_executable_async("brave.exe", "Brave Browser")
+    if "chrome" in command:
+        launch_executable_async("chrome.exe", "Google Chrome"); return
+    if "firefox" in command:
+        launch_executable_async("firefox.exe", "Mozilla Firefox"); return
+    if "brave" in command:
+        launch_executable_async("brave.exe", "Brave Browser"); return
 
-    # PyCharm
-    elif "pycharm" in command:
-        launch_executable_async("pycharm64.exe", "PyCharm")
+    # IDEs
+    if "pycharm" in command:
+        launch_executable_async("pycharm64.exe", "PyCharm"); return
 
-    # Full Visual Studio
-    elif "visual studio" in command:
-        vs_key = "devenv.exe"
+    if "visual studio" in command:
+        # full VS
+        vs_key     = "devenv.exe"
         vs_default = r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\devenv.exe"
         if os.path.exists(vs_default):
             os.startfile(vs_default)
-            exe_cache[vs_key] = vs_default
-            save_cache()
+            exe_cache[vs_key] = vs_default; save_cache()
             speak("Opening Visual Studio.")
         else:
             found = find_executable(vs_key)
             if found:
-                exe_cache[vs_key] = found
-                save_cache()
+                exe_cache[vs_key] = found; save_cache()
                 os.startfile(found)
                 speak("Found and opening Visual Studio.")
             else:
@@ -168,58 +175,65 @@ def handle_command(phrase_time=4.0):
                 manual = prompt_for_exe("Locate devenv.exe")
                 if manual and os.path.exists(manual):
                     os.startfile(manual)
-                    exe_cache[vs_key] = manual
-                    save_cache()
+                    exe_cache[vs_key] = manual; save_cache()
                     speak("Opening Visual Studio.")
                 else:
-                    speak("That path doesn’t exist or wasn’t selected.")
+                    speak("That path doesn’t exist.")
+        return
 
-    # VS Code — **synchronous & GUI prompt** if all else fails
-    elif "code" in command:
-        code_key = "code.exe"
-        # 1) Clear stale cache
-        if code_key in exe_cache and not os.path.exists(exe_cache[code_key]):
-            exe_cache.pop(code_key); save_cache()
-
-        # 2) Try per-user & system installs
-        user_path = os.path.expandvars(r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe")
+    if "code" in command:
+        # VS Code paths
+        code_key    = "code.exe"
+        user_path   = os.path.expandvars(r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe")
         system_path = r"C:\Program Files\Microsoft VS Code\Code.exe"
         if os.path.exists(user_path):
             os.startfile(user_path)
-            exe_cache[code_key] = user_path
-            save_cache()
+            exe_cache[code_key] = user_path; save_cache()
             speak("Opening Visual Studio Code.")
         elif os.path.exists(system_path):
             os.startfile(system_path)
-            exe_cache[code_key] = system_path
-            save_cache()
+            exe_cache[code_key] = system_path; save_cache()
             speak("Opening Visual Studio Code.")
         else:
-            # 3) Limited search
             found = find_executable(code_key)
             if found:
                 os.startfile(found)
-                exe_cache[code_key] = found
-                save_cache()
+                exe_cache[code_key] = found; save_cache()
                 speak("Found and opening Visual Studio Code.")
             else:
-                # 4) GUI prompt
                 speak("Please select the VS Code executable.")
                 manual = prompt_for_exe("Locate Code.exe")
                 if manual and os.path.exists(manual):
                     os.startfile(manual)
-                    exe_cache[code_key] = manual
-                    save_cache()
+                    exe_cache[code_key] = manual; save_cache()
                     speak("Opening Visual Studio Code.")
                 else:
-                    speak("That path doesn’t exist or wasn’t selected.")
+                    speak("That path doesn’t exist.")
+        return
 
-    # IntelliJ
-    elif "intellij" in command:
+    if "intellij" in command:
         launch_executable_async("idea64.exe", "IntelliJ IDEA")
+        return
 
-    else:
-        speak("I’m not sure how to open that.")
+    # --- Custom Commands ---
+    for cmd in custom_commands:
+        phrase = cmd.get("phrase", "").lower()
+        if phrase and phrase in command:
+            action = cmd.get("action")
+            resp   = cmd.get("response", "")
+            if action == "launch_executable":
+                launch_executable_async(cmd["exe_name"], cmd["app_name"])
+            elif action == "url":
+                webbrowser.open(cmd["url"])
+                if resp: speak(resp)
+            elif action == "shell":
+                subprocess.Popen(cmd["shell_cmd"], shell=True)
+                if resp: speak(resp)
+            return
+
+    # --- Fallback ---
+    speak("I’m not sure how to open that.")
+    return
 
 # === Main Wake-Word Loop ===
 def main():
@@ -241,7 +255,7 @@ def main():
     speak("Assistant ready. Say 'hey assistant' to begin.")
     try:
         while True:
-            pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+            pcm   = stream.read(porcupine.frame_length, exception_on_overflow=False)
             frame = struct.unpack_from("h" * porcupine.frame_length, pcm)
             if porcupine.process(frame) >= 0:
                 handle_command()
@@ -249,11 +263,8 @@ def main():
     except KeyboardInterrupt:
         speak("Goodbye.")
     finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
-        porcupine.delete()
-        tts.stop()
+        stream.stop_stream(); stream.close()
+        pa.terminate(); porcupine.delete(); tts.stop()
 
 if __name__ == "__main__":
     main()
