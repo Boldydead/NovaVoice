@@ -173,7 +173,3 @@ Modify the `custom_commands.json` file as described in the "Configuration" secti
     * The command phrase may not be defined in `COMMAND_DISPATCHER` or your `custom_commands.json`.
     * For application launching, the app might not be in the predefined list or easily findable in standard search paths.
 * **TTS or Speech Recognition Issues**: Ensure `pyttsx3` and `SpeechRecognition` are correctly installed and that you have an active internet connection for Google Speech Recognition.
-
----
-
-*This README provides a starting point. Feel free to add more details, a "Future Enhancements" section, or a "License" section (e.g., MIT License is common for open-source projects).*
