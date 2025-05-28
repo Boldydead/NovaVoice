@@ -1,1 +1,6 @@
-
+pvporcupine
+pyaudio
+pyttsx3
+SpeechRecognition
+psutil
+python-dotenv
