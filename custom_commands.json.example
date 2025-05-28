@@ -1,0 +1,11 @@
+{
+  "commands": [
+    {
+      "phrase": "example custom launch",
+      "action": "launch_executable",
+      "exe_name": "notepad.exe",
+      "app_name": "Notepad via Custom Command",
+      "response": "Launching Notepad through a custom command example."
+    }
+  ]
+}
