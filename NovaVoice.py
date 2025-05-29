@@ -13,8 +13,8 @@ import speech_recognition as sr
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog
-from dotenv import load_dotenv
-import datetime  # Ensure datetime is imported
+from dotenv import load_dotenv, find_dotenv  # Added find_dotenv for potential path info
+import datetime
 import time
 import logging
 
@@ -26,44 +26,125 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
+        # Not running in a PyInstaller bundle
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 
 # === Config & Constants ===
-load_dotenv()
+
+# --- Determine potential locations for the .env file ---
+app_name_for_folders = "NovaVoice"  # Used for creating a dedicated config folder
+expected_dotenv_locations = []
+loaded_dotenv_path_info = {"loaded": False, "path": "Not found or loaded by default search"}
+
+# Location 1: Application-specific config directory in AppData\Roaming (Recommended)
+try:
+    appdata_roaming_path = os.getenv('APPDATA')
+    if appdata_roaming_path:
+        app_config_dir = os.path.join(appdata_roaming_path, app_name_for_folders)
+        # Note: The script does not create this directory. User should create it if they want to use this location.
+        # For auto-creation, you could add: os.makedirs(app_config_dir, exist_ok=True)
+        expected_dotenv_locations.append(os.path.join(app_config_dir, ".env"))
+    else:
+        logging.warning("APPDATA environment variable not found. Cannot check Roaming AppData location for .env.")
+except Exception as e_appdata:
+    logging.error(f"Error determining APPDATA path for .env: {e_appdata}")
+
+# Location 2: Directory where the .exe or .py script is located (Fallback)
+try:
+    if getattr(sys, 'frozen', False):  # Running as a bundled executable (PyInstaller)
+        script_or_exe_dir = os.path.dirname(sys.executable)  # sys.executable is the path to the .exe
+    elif __file__:  # Running as a .py script
+        script_or_exe_dir = os.path.dirname(os.path.abspath(__file__))
+    else:  # Fallback (e.g., interactive interpreter where __file__ is not defined)
+        script_or_exe_dir = os.getcwd()
+    expected_dotenv_locations.append(os.path.join(script_or_exe_dir, ".env"))
+except Exception as e_exe_dir:
+    logging.error(f"Error determining executable/script directory for .env: {e_exe_dir}")
+    # As a further fallback if __file__ and sys.executable logic fails, add CWD.
+    current_working_dir_env = os.path.join(os.getcwd(), ".env")
+    if current_working_dir_env not in expected_dotenv_locations:
+        expected_dotenv_locations.append(current_working_dir_env)
+
+# --- Attempt to load .env from the prioritized locations ---
+for dotenv_path_to_try in expected_dotenv_locations:
+    if dotenv_path_to_try and os.path.exists(dotenv_path_to_try):  # Check if path is valid and exists
+        if load_dotenv(dotenv_path_to_try, override=True):  # override=True ensures this takes precedence
+            logging.info(f"Successfully loaded .env from: {dotenv_path_to_try}")
+            loaded_dotenv_path_info["loaded"] = True
+            loaded_dotenv_path_info["path"] = dotenv_path_to_try
+            break  # Stop searching once found and successfully loaded
+        else:
+            logging.warning(
+                f"Found .env at {dotenv_path_to_try} but load_dotenv() reported failure (e.g. empty file or permission issue).")
+    else:
+        if dotenv_path_to_try:  # Only log if it was a valid path attempt
+            logging.info(f".env file not found at trial location: {dotenv_path_to_try}")
+
+# If still not loaded after checking specific paths, try a final default search by python-dotenv
+# This default search looks in os.getcwd() and its parents by default.
+if not loaded_dotenv_path_info["loaded"]:
+    logging.info(
+        "Attempting final fallback to default load_dotenv() search (e.g., current working directory and parents).")
+    # find_dotenv will find the path if default load_dotenv succeeds
+    env_path_by_find_dotenv = find_dotenv(usecwd=True, raise_error_if_not_found=False)
+    if load_dotenv(override=True):  # override=True
+        logging.info(
+            f".env file loaded using default search logic (found at: {env_path_by_find_dotenv or 'unknown default path'}).")
+        loaded_dotenv_path_info["loaded"] = True
+        loaded_dotenv_path_info["path"] = env_path_by_find_dotenv or "Found by default search"
+    else:
+        logging.error(".env file could not be loaded by any method. PORCUPINE_ACCESS_KEY will be missing.")
+        print(
+            "CRITICAL: .env file containing PORCUPINE_ACCESS_KEY was not found by any method. Ensure it exists in a checked location.")
+
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 if not PORCUPINE_ACCESS_KEY:
-    logging.error("PORCUPINE_ACCESS_KEY not found in .env file. Please create a .env file and add it.")
-    # sys.exit(1) # Commented out for environments where .env might not be present but user wants to see code
-    print("WARNING: PORCUPINE_ACCESS_KEY not found. Wake word detection will fail.")
+    logging.error(
+        "PORCUPINE_ACCESS_KEY is not set in the environment. This usually means the .env file was not found, not loaded correctly, or the key is missing from the .env file. Wake word detection will fail.")
+    print(
+        "WARNING: PORCUPINE_ACCESS_KEY not loaded. Please ensure your .env file is in a recognized location (e.g., %APPDATA%\\NovaVoice\\.env or next to the executable) and contains the key. Wake word detection will fail.")
 
 WAKE_WORD_PPN_FILENAME = "hey google_windows.ppn"  # Make sure you have this file or update the name
+WAKE_WORD_PPN = None  # Initialize to None
 try:
-    WAKE_WORD_PPN = resource_path(WAKE_WORD_PPN_FILENAME)
-    if not os.path.exists(WAKE_WORD_PPN):
-        logging.error(f"Wake word file '{WAKE_WORD_PPN_FILENAME}' not found at '{WAKE_WORD_PPN}'.")
-        if not getattr(sys, 'frozen', False):  # if not running as a bundled exe
-            alt_path = os.path.join(os.path.abspath("."), WAKE_WORD_PPN_FILENAME)
+    # resource_path is for files BUNDLED with the exe or next to the script for dev
+    potential_ppn_path = resource_path(WAKE_WORD_PPN_FILENAME)
+    if os.path.exists(potential_ppn_path):
+        WAKE_WORD_PPN = potential_ppn_path
+        logging.info(f"Wake word file found at: {WAKE_WORD_PPN}")
+    else:
+        logging.error(f"Wake word file '{WAKE_WORD_PPN_FILENAME}' not found at primary path '{potential_ppn_path}'.")
+        # This specific fallback for .ppn might be less relevant if resource_path is robust for bundled files.
+        # For development (not bundled), if resource_path defaults to CWD and PPN is not there but in script dir:
+        if not getattr(sys, 'frozen', False) and __file__:
+            alt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), WAKE_WORD_PPN_FILENAME)
             if os.path.exists(alt_path):
                 WAKE_WORD_PPN = alt_path
-                logging.info(f"Found wake word file at alternate path: {WAKE_WORD_PPN}")
+                logging.info(f"Found wake word file at alternate dev path: {WAKE_WORD_PPN}")
             else:
-                logging.error(f"Also not found at alternate path: {alt_path}")
-                # sys.exit(1) # Commented out
-                print(f"ERROR: Wake word file '{WAKE_WORD_PPN_FILENAME}' not found. Wake word detection will fail.")
-        # else: # If bundled and not found, it's a problem
-        # sys.exit(1) # Commented out
+                logging.error(f"Also not found at alternate dev path: {alt_path}")
+                # WAKE_WORD_PPN remains None
+        elif getattr(sys, 'frozen', False):  # Bundled but not found by resource_path
+            logging.error(
+                f"CRITICAL (Bundled): Wake word file '{WAKE_WORD_PPN_FILENAME}' not found at expected bundled path '{potential_ppn_path}'. Ensure it was added to PyInstaller (--add-data).")
+            # WAKE_WORD_PPN remains None
+
+    if not WAKE_WORD_PPN:  # If still None after all checks
+        print(f"ERROR: Wake word file '{WAKE_WORD_PPN_FILENAME}' could not be located. Wake word detection will fail.")
+
 except Exception as e:
     logging.error(f"Error resolving resource path for PPN file: {e}")
-    # sys.exit(1) # Commented out
-    print(f"ERROR: Could not resolve PPN file path. Wake word detection will fail.")
+    WAKE_WORD_PPN = None  # Ensure it's None if path resolution failed
+    print(f"ERROR: Could not resolve PPN file path due to an exception. Wake word detection will fail.")
 
 CACHE_FILE = resource_path("exe_cache.json")
-CUSTOM_CMDS_FILE = resource_path("custom_commands.json")
-DAILY_CACHE_FILE = resource_path("daily_text.json")
+CUSTOM_CMDS_FILE = resource_path("custom_commands.json")  # Script handles if this doesn't exist
+DAILY_CACHE_FILE = resource_path("daily_text.json")  # Script handles if this doesn't exist
 
 SEARCH_PATHS = [
     r"C:\Program Files",
@@ -73,39 +154,65 @@ SEARCH_PATHS = [
 
 APP_LAUNCH_MAP = {
     "chrome": "chrome.exe", "firefox": "firefox.exe", "brave": "brave.exe",
-    "edge": "msedge.exe",  # Microsoft Edge
+    "edge": "msedge.exe",
     "pycharm": "pycharm64.exe", "intellij": "idea64.exe",
     "visual studio": "devenv.exe", "code": "Code.exe", "vs code": "Code.exe",
     "notepad": "notepad.exe", "calculator": "calc.exe", "explorer": "explorer.exe",
     "word": "winword.exe", "excel": "excel.exe", "powerpoint": "powerpnt.exe",
     "spotify": "spotify.exe", "discord": "discord.exe", "steam": "steam.exe",
     "zoom": "zoom.exe", "teams": "teams.exe",
-    "slack": "slack.exe", "obs": "obs64.exe",  # OBS Studio
-    "gimp": "gimp-2.10.exe",  # Example, actual exe might vary
+    "slack": "slack.exe", "obs": "obs64.exe",
+    "gimp": "gimp-2.10.exe",
     "vlc": "vlc.exe",
 }
 
 
 # === Load or Initialize Cache & Custom Commands ===
 def load_json_data(file_path, default_data=None):
-    """Loads JSON data from a file, returning default_data if file not found or corrupted."""
-    if default_data is None:
-        default_data = {}
-    if os.path.exists(file_path):
+    if default_data is None: default_data = {}
+    actual_path = file_path  # Path already resolved by resource_path or similar logic
+    if os.path.exists(actual_path):
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(actual_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except json.JSONDecodeError:
-            logging.warning(f"Could not decode JSON from {file_path}. Using default data.")
+            logging.warning(f"Could not decode JSON from {actual_path}. Using default data.")
             return default_data
         except Exception as e:
-            logging.error(f"Error loading {file_path}: {e}. Using default data.")
+            logging.error(f"Error loading {actual_path}: {e}. Using default data.")
             return default_data
+    else:
+        logging.info(f"JSON file not found at {actual_path}. Using default data.")
     return default_data
 
 
 exe_cache = load_json_data(CACHE_FILE, {})
-custom_commands_data = load_json_data(CUSTOM_CMDS_FILE, {"commands": []})
+
+# For custom_commands, it's better to look for it relative to the .exe/script dir or AppData
+# rather than bundling it, as users are meant to edit it.
+# Let's use the same logic as .env for custom_commands.json
+custom_cmds_path_to_use = None
+for loc_base in [os.path.join(os.getenv('APPDATA', ''), app_name_for_folders) if os.getenv('APPDATA') else None,
+                 # AppData first
+                 script_or_exe_dir]:  # Then next to exe/script
+    if loc_base:  # Ensure loc_base is not None (e.g. if APPDATA failed)
+        potential_path = os.path.join(loc_base, "custom_commands.json")
+        if os.path.exists(potential_path):
+            custom_cmds_path_to_use = potential_path
+            logging.info(f"Using custom_commands.json from: {custom_cmds_path_to_use}")
+            break
+if not custom_cmds_path_to_use:
+    # If not found in preferred locations, resource_path would try bundled (if added) or CWD.
+    # But custom_commands usually shouldn't be bundled if user-editable.
+    # We'll let load_json_data use the path from resource_path("custom_commands.json")
+    # which will default to CWD or _MEIPASS if bundled (which is not ideal for user editing)
+    # So, we explicitly set it to a path that will likely not exist if not in preferred locations,
+    # leading to default_data being used by load_json_data if user hasn't created it.
+    custom_cmds_path_to_use = os.path.join(script_or_exe_dir, "custom_commands.json")  # Default to looking next to exe
+    logging.info(
+        f"custom_commands.json not found in primary user locations. Will attempt to load from/create near executable: {custom_cmds_path_to_use} or use default empty commands.")
+
+custom_commands_data = load_json_data(custom_cmds_path_to_use, {"commands": []})
 custom_commands = custom_commands_data.get("commands", [])
 
 # === Thread-safe TTS Setup ===
@@ -132,7 +239,6 @@ except Exception as e:
 
 
 def speak(text):
-    """Speaks the given text using TTS engine if available."""
     if not tts:
         logging.warning(f"TTS not available. Intended to speak: {text}")
         print(f"ASSISTANT (TTS Disabled): {text}")
@@ -181,7 +287,7 @@ def sleep_system():
 
 
 def shutdown_system():
-    os.system("shutdown /s /t 0")  # For Windows
+    os.system("shutdown /s /t 0")
     logging.info("System shutting down.")
 
 
@@ -204,7 +310,7 @@ def find_executable(exe_name):
             continue
         for root, dirs, files in os.walk(base, topdown=True):
             current_depth = os.path.abspath(root).count(os.sep) - os.path.abspath(base).count(os.sep)
-            if current_depth > 5:  # Max depth
+            if current_depth > 5:
                 logging.debug(f"Reached max search depth in {root}, pruning walk.")
                 dirs[:] = []
                 continue
@@ -224,7 +330,6 @@ def find_executable(exe_name):
 
 
 def launch_executable_async(exe_name, app_name):
-    """Launches an executable. Searches if not cached. Runs in a separate thread."""
     path = exe_cache.get(exe_name.lower())
     if path and not os.path.exists(path):
         logging.info(f"Cached path for {exe_name} ('{path}') no longer exists. Removing from cache.")
@@ -243,14 +348,35 @@ def launch_executable_async(exe_name, app_name):
     speak(f"Searching for {app_name}, please wait.")
 
     def _search_and_launch_thread():
+        # For exe_cache and daily_text, determine writable path
+        # Prefer AppData, then next to exe/script
+        writable_config_dir = script_or_exe_dir  # Default
+        try:
+            appdata_path_local = os.getenv('LOCALAPPDATA')  # Local AppData often better for caches
+            if appdata_path_local:
+                potential_dir = os.path.join(appdata_path_local, app_name_for_folders)
+                os.makedirs(potential_dir, exist_ok=True)  # Ensure it exists
+                writable_config_dir = potential_dir
+            elif os.getenv('APPDATA'):  # Fallback to Roaming if LOCALAPPDATA not set
+                potential_dir = os.path.join(os.getenv('APPDATA'), app_name_for_folders)
+                os.makedirs(potential_dir, exist_ok=True)
+                writable_config_dir = potential_dir
+        except Exception as e_mkdir:
+            logging.warning(
+                f"Could not create/use AppData directory for cache, using executable's directory: {e_mkdir}")
+            # writable_config_dir remains script_or_exe_dir
+
+        current_cache_file = os.path.join(writable_config_dir, os.path.basename(CACHE_FILE))
+
         found_path = find_executable(exe_name)
         if found_path:
             exe_cache[exe_name.lower()] = found_path
             try:
-                with open(CACHE_FILE, 'w', encoding="utf-8") as f_cache:
+                with open(current_cache_file, 'w', encoding="utf-8") as f_cache:
                     json.dump(exe_cache, f_cache)
+                logging.info(f"Updated exe_cache at {current_cache_file}")
             except Exception as e_cache_write:
-                logging.error(f"Error writing to exe_cache.json: {e_cache_write}")
+                logging.error(f"Error writing to exe_cache.json at {current_cache_file}: {e_cache_write}")
 
             try:
                 os.startfile(found_path)
@@ -280,7 +406,6 @@ def open_default_browser(url="https://www.google.com"):
 
 # === GUI Prompt for Manual Path ===
 def prompt_for_exe(title="Select executable"):
-    """Opens a file dialog for the user to select an executable. (Currently not used in main flow)"""
     try:
         root = tk.Tk()
         root.withdraw()
@@ -305,7 +430,7 @@ def cmd_open_google(command_text):
 
 
 def cmd_open_youtube(command_text):
-    if open_default_browser("https://www.youtube.com"):
+    if open_default_browser("https://www.youtube.com"):  # Original URL
         speak("Opening YouTube.")
     else:
         speak("I couldn't open YouTube in your browser.")
@@ -356,7 +481,7 @@ def cmd_show_help(command_text):
         "turn off the computer", "what's my battery level",
         "what time is it", "what is today's date",
         "tell me today's Bible verse",
-        "what apps can you open"  # or "what can you open"
+        "what can you open"
     ]
     speak("I can understand commands like:")
     for b_cmd_idx, b_cmd in enumerate(built_ins):
@@ -378,19 +503,15 @@ def cmd_show_help(command_text):
 
 
 def cmd_list_known_apps(command_text):
-    """Compiles and speaks a list of applications the assistant knows it can try to open."""
     known_apps_friendly_names = set()
-
     for app_alias in APP_LAUNCH_MAP.keys():
         known_apps_friendly_names.add(app_alias.title())
-
-    if exe_cache:
+    if exe_cache:  # exe_cache is loaded from a file determined by writable_config_dir logic implicitly
         for exe_name_lower_key in exe_cache.keys():
             app_name_from_cache = exe_name_lower_key.replace(".exe", "")
             app_name_from_cache = ' '.join(word.capitalize() for word in app_name_from_cache.split())
             known_apps_friendly_names.add(app_name_from_cache)
-
-    for cmd_config in custom_commands:
+    for cmd_config in custom_commands:  # custom_commands loaded from preferred path
         if cmd_config.get("action") == "launch_executable":
             app_name = cmd_config.get("app_name")
             if app_name:
@@ -401,7 +522,6 @@ def cmd_list_known_apps(command_text):
                     friendly_exe_name = exe_name.lower().replace(".exe", "")
                     friendly_exe_name = ' '.join(word.capitalize() for word in friendly_exe_name.split())
                     known_apps_friendly_names.add(friendly_exe_name)
-
     if not known_apps_friendly_names:
         speak("I don't have a specific list of pre-identified applications right now. "
               "However, you can ask me to 'open' or 'launch' any application by its name, "
@@ -409,56 +529,44 @@ def cmd_list_known_apps(command_text):
     else:
         speak_text = "Based on my configuration and past successful launches, I can try to open apps like: "
         apps_to_speak = sorted(list(known_apps_friendly_names))
-
-        if not apps_to_speak:  # Should not happen if known_apps_friendly_names was not empty
+        if not apps_to_speak:
             speak("I couldn't compile a list of apps right now. Try asking me to open one directly!")
             return
-
         if len(apps_to_speak) > 7:
             speak_text += ", ".join(apps_to_speak[:6]) + ", and others such as " + apps_to_speak[6] + "."
         elif len(apps_to_speak) > 1:
             speak_text += ", ".join(apps_to_speak[:-1]) + ", and " + apps_to_speak[-1] + "."
-        else:  # Exactly one app
+        else:
             speak_text += apps_to_speak[0] + "."
-
         speak(speak_text)
         speak("You can also try asking for any other application not mentioned, and I'll search for it.")
 
 
 def cmd_tell_capabilities(command_text):
-    """Provides a comprehensive spoken overview of the assistant's capabilities."""
     speak("I can help you with various tasks on your computer after you say my wake word.")
     speak("Here's an overview of what I can do:")
-
     speak(
         "First, I can open applications. For example, you can ask me to 'open Chrome', 'launch Spotify', or 'open Notepad'. "
         "I have a list of these common applications, and I can also search for others if you ask. "
         "If you'd like a more detailed list of applications I'm already familiar with or have found before, you can say 'what applications can you open'.")
-
     speak("Second, I can open websites. For example, try saying 'open Google' or 'open YouTube'.")
-
     speak(
         "Third, I can provide information. You can ask me 'what time is it', 'what is today's date', or 'what's my battery level'.")
-
     speak(
         "Fourth, I can control some system settings on Windows. For instance, 'mute the system', 'put computer to sleep', or 'turn off the computer'.")
-
     speak(
         "I can also attempt to fetch a daily Bible verse for you if you ask, though please note the current source for this is a placeholder message.")
-
     if custom_commands:
         speak(
             "Additionally, I can run custom commands that you've set up. These can include launching specific programs with a unique phrase, opening particular web pages, or running shell scripts.")
     else:
         speak(
             "And if you were to set up custom commands, I could perform those too, allowing you to tailor my actions to your needs!")
-
     speak("For a shorter list of example command phrases you can use, just say 'help'.")
 
 
 # === Command Dispatcher ===
 COMMAND_DISPATCHER = {
-    # Comprehensive capabilities
     "what can you do": cmd_tell_capabilities,
     "what are your capabilities": cmd_tell_capabilities,
     "tell me your capabilities": cmd_tell_capabilities,
@@ -467,26 +575,14 @@ COMMAND_DISPATCHER = {
     "what can you open and what can you do": cmd_tell_capabilities,
     "describe your functions": cmd_tell_capabilities,
     "what all can you do": cmd_tell_capabilities,
-
-    # Existing commands
-    "help": cmd_show_help,
-    "list commands": cmd_show_help,
-    "google": cmd_open_google,
-    "youtube": cmd_open_youtube,
-    "mute": cmd_mute_system,
-    "sleep": cmd_sleep_system,
-    "turn off": cmd_shutdown_system,
-    "shut down": cmd_shutdown_system,
+    "help": cmd_show_help, "list commands": cmd_show_help,
+    "google": cmd_open_google, "youtube": cmd_open_youtube,
+    "mute": cmd_mute_system, "sleep": cmd_sleep_system,
+    "turn off": cmd_shutdown_system, "shut down": cmd_shutdown_system,
     "battery": cmd_get_battery,
-    "time": cmd_get_current_time,
-    "what time is it": cmd_get_current_time,
-    "current time": cmd_get_current_time,
-    "date": cmd_get_current_date,
-    "today's date": cmd_get_current_date,
-    "what is today's date": cmd_get_current_date,
-
-    # App listing commands
-    "what can you open": cmd_list_known_apps,  # CORRECTED: Added this line
+    "time": cmd_get_current_time, "what time is it": cmd_get_current_time, "current time": cmd_get_current_time,
+    "date": cmd_get_current_date, "today's date": cmd_get_current_date, "what is today's date": cmd_get_current_date,
+    "what can you open": cmd_list_known_apps,
     "what apps can you open": cmd_list_known_apps,
     "what applications can you open": cmd_list_known_apps,
     "list apps i can open": cmd_list_known_apps,
@@ -501,7 +597,6 @@ def handle_command(phrase_listen_timeout=5.0, phrase_time_limit=10.0):
     if not mic:
         speak("Microphone is not available, cannot listen for commands.")
         return
-
     speak("What would you like me to do?")
     command = ""
     try:
@@ -512,7 +607,6 @@ def handle_command(phrase_listen_timeout=5.0, phrase_time_limit=10.0):
             except sr.WaitTimeoutError:
                 logging.info("No speech detected within timeout.")
                 return
-
         logging.info("Processing command...")
         command = recognizer.recognize_google(audio).lower().strip()
         speak(f"You said: {command}")
@@ -528,61 +622,43 @@ def handle_command(phrase_listen_timeout=5.0, phrase_time_limit=10.0):
         speak("An unexpected error occurred while trying to understand you.")
         logging.error(f"Error during speech recognition: {e}")
         return
-
-    if not command:
-        return
-
+    if not command: return
     common_wake_phrases = ("hey assistant", "assistant", "hey google", "google")
-    # original_command_for_custom_check = command
     for trig in common_wake_phrases:
         if command.startswith(trig):
             command = command.replace(trig, "", 1).strip()
             logging.debug(f"Command after stripping '{trig}': {command}")
             break
-
     if not command:
         speak("I didn't get a specific command after the wake phrase.")
         return
 
-    # --- Try Command Dispatcher First (Exact Match) ---
     if command in COMMAND_DISPATCHER:
         COMMAND_DISPATCHER[command](command)
         return
-
-    # --- Try Command Dispatcher (Keyword/Substring Match) ---
-    # Sort dispatcher keys by length (descending) to match longer phrases first
-    # This helps ensure more specific commands are matched before more generic ones if they are substrings
     sorted_keywords = sorted(COMMAND_DISPATCHER.keys(), key=len, reverse=True)
     for keyword in sorted_keywords:
-        # Ensure keyword is not empty and is actually in the command as a whole word or phrase
         if keyword and keyword in command:
-            # A more robust check could involve regex word boundaries if needed,
-            # but for phrase-based commands, 'keyword in command' is often sufficient.
             func = COMMAND_DISPATCHER[keyword]
             func(command)
             return
 
-    # --- Fallback to existing if/elif for other commands ---
-    if "edge" in command:  # Specific handling for Edge, can also be in APP_LAUNCH_MAP
+    if "edge" in command:
         if open_default_browser("https://www.microsoft.com/edge"):
             speak("Opening Microsoft Edge.")
         else:
             speak("I couldn't open Edge.")
         return
-
-    # Generic App Launch
     if command.startswith("open ") or command.startswith("launch "):
         parts = command.split(" ", 1)
         if len(parts) > 1:
             app_to_launch = parts[1].strip()
-            if app_to_launch:  # Check if app_to_launch is not empty
+            if app_to_launch:
                 app_exe = APP_LAUNCH_MAP.get(app_to_launch.lower())
-
                 if app_exe:
                     launch_executable_async(app_exe, app_to_launch.title())
                     return
                 else:
-                    # Check custom commands by app_name before generic guess
                     for c_cmd in custom_commands:
                         custom_app_name = c_cmd.get("app_name", "")
                         if custom_app_name and custom_app_name.lower() == app_to_launch.lower() and \
@@ -591,31 +667,24 @@ def handle_command(phrase_listen_timeout=5.0, phrase_time_limit=10.0):
                             if exe_name_custom:
                                 launch_executable_async(exe_name_custom, app_to_launch.title())
                                 return
-                            break  # Found app_name in custom, but no exe_name, stop.
-                    else:  # If not found in custom commands by app_name, try generic guess
+                            break
+                    else:
                         app_exe_guess = app_to_launch + ".exe" if not app_to_launch.lower().endswith(
                             ".exe") else app_to_launch
                         logging.info(f"Attempting generic launch for: {app_exe_guess} ({app_to_launch.title()})")
                         launch_executable_async(app_exe_guess, app_to_launch.title())
                         return
-        # Fall through if "open" or "launch" was said with no app name.
-
-    # Daily Text
     if "bible verse" in command or "daily text" in command or "today's text" in command:
         speak("Fetching today's Bible verse, please wait.")
         daily_scripture = fetch_daily_text()
         speak(daily_scripture)
         return
-
-    # --- Custom Commands (using original command for exact phrase match) ---
-    # Match against the command *after* wake words have been stripped
     for cmd_config in custom_commands:
         phrase = cmd_config.get("phrase", "").lower()
-        if phrase and phrase == command:  # Exact match for custom phrase
+        if phrase and phrase == command:
             action = cmd_config.get("action")
             response = cmd_config.get("response", f"Okay, performing your custom action for '{phrase}'.")
             logging.info(f"Executing custom command for exact phrase: '{phrase}', action: {action}")
-
             if action == "launch_executable":
                 exe_name = cmd_config.get("exe_name")
                 app_name_custom = cmd_config.get("app_name", exe_name or "the application")
@@ -646,34 +715,47 @@ def handle_command(phrase_listen_timeout=5.0, phrase_time_limit=10.0):
                     speak(f"Shell command missing for custom command '{phrase}'.")
             else:
                 speak(f"Unknown action type '{action}' for custom command '{phrase}'.")
-            return  # Custom command processed
-
+            return
     speak("I'm not sure how to do that yet.")
 
 
 # === Daily Text & Wisdom Functions ===
 def fetch_daily_text():
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    cached_data = load_json_data(DAILY_CACHE_FILE)
+    # For daily_text_cache, determine writable path
+    # Prefer AppData, then next to exe/script
+    writable_config_dir_daily = script_or_exe_dir  # Default
+    try:
+        appdata_path_local = os.getenv('LOCALAPPDATA')
+        if appdata_path_local:
+            potential_dir = os.path.join(appdata_path_local, app_name_for_folders)
+            os.makedirs(potential_dir, exist_ok=True)
+            writable_config_dir_daily = potential_dir
+        elif os.getenv('APPDATA'):
+            potential_dir = os.path.join(os.getenv('APPDATA'), app_name_for_folders)
+            os.makedirs(potential_dir, exist_ok=True)
+            writable_config_dir_daily = potential_dir
+    except Exception as e_mkdir_daily:
+        logging.warning(
+            f"Could not create/use AppData directory for daily_text_cache, using executable's directory: {e_mkdir_daily}")
+
+    current_daily_cache_file = os.path.join(writable_config_dir_daily, os.path.basename(DAILY_CACHE_FILE))
+
+    cached_data = load_json_data(current_daily_cache_file)  # load_json_data now takes resolved path
     if cached_data.get("date") == today_str and cached_data.get("text"):
-        logging.info("Using cached daily text.")
+        logging.info(f"Using cached daily text from {current_daily_cache_file}.")
         return cached_data["text"]
 
     logging.warning(
         "Web scraping for jw.org daily text is highly dependent on website structure and may fail or return this message.")
     full_text = "Fetching the daily Bible verse from JW.org is currently unreliable due to website changes. Please check the website directly for today's text."
-
     try:
-        with open(DAILY_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(current_daily_cache_file, "w", encoding="utf-8") as f:
             json.dump({"date": today_str, "text": full_text}, f)
+        logging.info(f"Updated daily_text_cache at {current_daily_cache_file}")
     except Exception as e:
-        logging.error(f"Error writing to daily cache file {DAILY_CACHE_FILE}: {e}")
+        logging.error(f"Error writing to daily cache file {current_daily_cache_file}: {e}")
     return full_text
-
-
-def fetch_wisdom_quote():
-    logging.info("Fetching wisdom quote (currently uses daily text placeholder).")
-    return fetch_daily_text()
 
 
 # === Scheduler Thread ===
@@ -686,7 +768,6 @@ def scheduler_thread_func():
     while True:
         now = datetime.datetime.now()
         hour = now.hour
-
         if 7 <= hour < 8 and not daily_greeting_done_today:
             logging.info("Scheduler: Morning sequence triggered.")
             speak("Good morning! Here's something for your day.")
@@ -694,13 +775,11 @@ def scheduler_thread_func():
             text_for_day = fetch_daily_text()
             speak(text_for_day)
             daily_greeting_done_today = True
-
-        if hour < 6:  # Reset daily flag early in the morning (e.g., before 6 AM)
+        if hour < 6:
             if daily_greeting_done_today:
                 logging.info("Scheduler: Resetting daily_greeting_done_today flag.")
                 daily_greeting_done_today = False
-
-        time.sleep(30)  # Check every 30 seconds
+        time.sleep(30)
 
 
 # === Main Wake-Word Loop ===
@@ -711,13 +790,11 @@ audio_stream = None
 
 def main_loop():
     global porcupine, pa, audio_stream
-
     if not PORCUPINE_ACCESS_KEY or not WAKE_WORD_PPN or not os.path.exists(WAKE_WORD_PPN):
         msg = "Porcupine Access Key or Wake Word PPN file is missing/invalid. Wake word engine cannot start."
         logging.error(msg)
         speak(msg) if tts else print(f"ERROR: {msg}")
         return
-
     try:
         porcupine = pvporcupine.create(
             access_key=PORCUPINE_ACCESS_KEY,
@@ -728,7 +805,7 @@ def main_loop():
         logging.error(f"Porcupine initialization failed: {e}")
         speak("I couldn't start my wake word engine. Please check the access key and keyword file.")
         return
-    except Exception as e_porc_general:  # Catch other potential errors during create
+    except Exception as e_porc_general:
         logging.error(f"An unexpected error occurred during Porcupine initialization: {e_porc_general}")
         speak("An unexpected error occurred while starting my wake word engine.")
         return
@@ -741,7 +818,7 @@ def main_loop():
             format=pyaudio.paInt16,
             input=True,
             frames_per_buffer=porcupine.frame_length,
-            input_device_index=None  # Use default input device
+            input_device_index=None
         )
     except Exception as e:
         logging.error(f"PyAudio stream opening failed: {e}")
@@ -750,43 +827,37 @@ def main_loop():
         if pa: pa.terminate()
         return
 
-    # Start scheduler thread only if audio setup is successful
     scheduler = threading.Thread(target=scheduler_thread_func, daemon=True)
     scheduler.start()
-
     speak("Assistant ready. Say 'Hey Google' or your wake word to begin.")
-    logging.info(f"Listening for wake word '{os.path.basename(WAKE_WORD_PPN)}'...")
-
+    logging.info(
+        f"Listening for wake word '{os.path.basename(WAKE_WORD_PPN if WAKE_WORD_PPN else WAKE_WORD_PPN_FILENAME)}'...")
     try:
         while True:
             try:
                 pcm = audio_stream.read(porcupine.frame_length, exception_on_overflow=False)
                 frame = struct.unpack_from("h" * porcupine.frame_length, pcm)
             except IOError as e:
-                # Check if e has errno attribute before accessing it
                 if hasattr(e, 'errno') and e.errno == pyaudio.paInputOverflowed:
                     logging.warning("Input overflowed. Skipping frame.")
-                    continue  # Skip this frame and continue
+                    continue
                 else:
                     logging.error(f"Audio stream read IOError (not overflow): {e}")
-                    # Consider a brief pause or attempt to re-initialize if persistent
-                    time.sleep(0.1)  # Brief pause
-                    continue  # Try to continue processing
-            except Exception as e_read_generic:  # Catch any other error during read/unpack
+                    time.sleep(0.1)
+                    continue
+            except Exception as e_read_generic:
                 logging.error(f"Unexpected error reading or unpacking audio stream: {e_read_generic}")
-                time.sleep(0.1)  # Brief pause
-                continue  # Try to continue
-
+                time.sleep(0.1)
+                continue
             keyword_index = porcupine.process(frame)
-            if keyword_index >= 0:  # Wake word detected
+            if keyword_index >= 0:
                 logging.info("Wake word detected!")
-                # Optional: play a sound
                 handle_command()
-                logging.info(f"Listening for wake word '{os.path.basename(WAKE_WORD_PPN)}' again...")
-
+                logging.info(
+                    f"Listening for wake word '{os.path.basename(WAKE_WORD_PPN if WAKE_WORD_PPN else WAKE_WORD_PPN_FILENAME)}' again...")
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received. Shutting down.")
-        if tts: speak("Goodbye.")  # Only speak if TTS is available
+        if tts: speak("Goodbye.")
     except Exception as e:
         logging.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
         if tts: speak("An unexpected error occurred. I might need to restart.")
@@ -794,8 +865,7 @@ def main_loop():
         logging.info("Cleaning up resources...")
         if audio_stream is not None:
             try:
-                if audio_stream.is_active():  # Check if stream is active before stopping
-                    audio_stream.stop_stream()
+                if audio_stream.is_active(): audio_stream.stop_stream()
                 audio_stream.close()
             except Exception as e_stream:
                 logging.error(f"Error closing audio stream: {e_stream}")
@@ -813,7 +883,6 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    # Critical checks before starting main_loop
     critical_failure = False
     if not mic:
         logging.error("Main loop not started: Microphone not available.")
@@ -822,34 +891,19 @@ if __name__ == "__main__":
         else:
             print("ERROR: Assistant cannot start: Microphone not available.")
         critical_failure = True
-
     if not PORCUPINE_ACCESS_KEY:
         logging.error("Main loop not started: Porcupine Access Key missing.")
-        # Speak call might have already happened if tts was available during initial check
-        if not tts:
+        if not tts and not critical_failure:
             print("ERROR: Assistant cannot start: Porcupine Access Key missing.")
-        elif not critical_failure:
+        elif tts and not critical_failure:
             speak("Porcupine Access Key is missing. Assistant cannot start.")
         critical_failure = True
 
-    # Check WAKE_WORD_PPN after resource_path attempt
-    # The try-except block for WAKE_WORD_PPN already logs and prints if it fails.
-    # Here, we just ensure that if it's None or path doesn't exist, we don't proceed.
-    resolved_ppn_path_exists = False
-    try:
-        # This re-evaluates WAKE_WORD_PPN's existence after resource_path logic
-        # This check is somewhat redundant if the initial try-except for WAKE_WORD_PPN is robust
-        # but serves as a final gate.
-        if WAKE_WORD_PPN and os.path.exists(WAKE_WORD_PPN):
-            resolved_ppn_path_exists = True
-    except:  # handles if WAKE_WORD_PPN is not even a string
-        pass
-
-    if not resolved_ppn_path_exists:
-        logging.error(
-            "Main loop not started: Wake word PPN file is missing or path is invalid after resource resolution.")
-        if not critical_failure:  # Avoid redundant speak if already failed for mic/key
-            msg = "Wake word file is missing. Assistant cannot start."
+    # WAKE_WORD_PPN is now initialized to None, so check its value directly
+    if not WAKE_WORD_PPN or not os.path.exists(WAKE_WORD_PPN):  # Check if WAKE_WORD_PPN was successfully set and exists
+        logging.error("Main loop not started: Wake word PPN file is missing, invalid, or could not be resolved.")
+        if not critical_failure:
+            msg = "Wake word file is missing or invalid. Assistant cannot start."
             if tts:
                 speak(msg)
             else:
@@ -859,4 +913,4 @@ if __name__ == "__main__":
     if not critical_failure:
         main_loop()
     else:
-        logging.info("Assistant did not start due to critical errors.")
+        logging.info("Assistant did not start due to critical errors listed above.")
